@@ -6,11 +6,19 @@ import csv
 import datetime as dt
 import io
 import json
+import os
+import sys
+from pathlib import Path
 from typing import Iterable, Optional
 from xml.etree import ElementTree
 
 import requests
 from sqlalchemy.exc import SQLAlchemyError
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 from db.models import (
     Award,
@@ -24,7 +32,11 @@ from db.models import (
 
 
 # A descriptive user agent keeps us in good standing with the public APIs.
-USER_AGENT = "InstaFlowTracker/0.1 (github.com/openai)"
+# The email can be overridden by setting PUBLIC_DATA_CONTACT_EMAIL in the
+# environment so API providers have a way to reach us if needed.
+DEFAULT_CONTACT = "ops@instaflow.local"
+CONTACT_EMAIL = os.getenv("PUBLIC_DATA_CONTACT_EMAIL", DEFAULT_CONTACT)
+USER_AGENT = f"InstaFlowTracker/0.1 (contact: {CONTACT_EMAIL})"
 
 
 def _get_session_headers() -> dict[str, str]:
@@ -191,11 +203,36 @@ def fetch_latest_13f_holdings(session, cik: str = "0001067983") -> None:
 def ingest_usaspending_awards(session, limit: int = 20) -> None:
     """Pull the most recent federal contract awards from USAspending."""
 
-    url = "https://api.usaspending.gov/api/v2/awards/"
-    params = {"page": 1, "limit": limit, "sort": "-date_signed"}
+    url = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+    today = dt.date.today()
+    payload = {
+        "filters": {
+            "award_type_codes": ["A", "B", "C", "D"],
+            "time_period": [
+                {
+                    "date_type": "action_date",
+                    "start_date": (today - dt.timedelta(days=30)).isoformat(),
+                    "end_date": today.isoformat(),
+                }
+            ],
+        },
+        "fields": [
+            "Award ID",
+            "Recipient Name",
+            "Award Amount",
+            "Awarding Agency",
+            "Action Date",
+            "Last Modified Date",
+        ],
+        "page": 1,
+        "limit": limit,
+        "sort": "Last Modified Date",
+        "order": "desc",
+    }
+
     try:
-        response = requests.get(
-            url, params=params, headers=_get_session_headers(), timeout=30
+        response = requests.post(
+            url, json=payload, headers=_get_session_headers(), timeout=30
         )
         response.raise_for_status()
     except requests.RequestException as exc:
@@ -207,7 +244,11 @@ def ingest_usaspending_awards(session, limit: int = 20) -> None:
 
     inserted = 0
     for award in results:
-        date_signed = award.get("date_signed")
+        date_signed = (
+            award.get("Action Date")
+            or award.get("Last Modified Date")
+            or award.get("Period of Performance Start Date")
+        )
         if not date_signed:
             continue
         try:
@@ -215,16 +256,17 @@ def ingest_usaspending_awards(session, limit: int = 20) -> None:
         except ValueError:
             continue
 
-        agency_name = award.get("awarding_agency", {}).get("toptier_name") or award.get(
-            "awarding_agency_name"
-        )
-        recipient = award.get("recipient", {}).get("recipient_name") or award.get(
-            "recipient_name"
-        )
-        amount = award.get("total_obligation")
-        program = award.get("type_description") or award.get("naics_description")
+        agency_name = award.get("Awarding Agency")
+        recipient = award.get("Recipient Name")
+        amount = award.get("Award Amount")
+        program = award.get("Category") or award.get("Award ID")
 
-        if not recipient or amount is None:
+        if not recipient or amount in (None, ""):
+            continue
+
+        try:
+            amount_value = float(str(amount).replace(",", ""))
+        except ValueError:
             continue
 
         company = get_or_create_company(session, recipient)
@@ -234,7 +276,7 @@ def ingest_usaspending_awards(session, limit: int = 20) -> None:
             .filter(
                 Award.date == award_date,
                 Award.company_id == company.id,
-                Award.amount_usd == amount,
+                Award.amount_usd == amount_value,
                 Award.source == "USAspending",
             )
             .one_or_none()
@@ -247,7 +289,7 @@ def ingest_usaspending_awards(session, limit: int = 20) -> None:
             agency=agency_name or "Unknown Agency",
             recipient=recipient,
             company_id=company.id,
-            amount_usd=float(amount),
+            amount_usd=amount_value,
             program=program,
             source="USAspending",
         )
@@ -266,26 +308,16 @@ def ingest_usaspending_awards(session, limit: int = 20) -> None:
 
 
 def ingest_patents(session, per_page: int = 25) -> None:
-    """Pull recent patents from the PatentsView API."""
+    """Pull recent innovation disclosures using the OpenAlex works API."""
 
-    query = {
-        "_gte": {"patent_date": (dt.date.today() - dt.timedelta(days=90)).isoformat()}
-    }
-    fields = [
-        "patent_number",
-        "patent_title",
-        "patent_date",
-        "assignees",
-        "patent_abstract",
-    ]
-    options = {"page": 1, "per_page": per_page}
-
-    url = "https://api.patentsview.org/patents/query"
+    window_start = (dt.date.today() - dt.timedelta(days=90)).isoformat()
     params = {
-        "q": json.dumps(query),
-        "f": json.dumps(fields),
-        "o": json.dumps(options),
+        "search": "patent",  # bias toward IP-related research
+        "filter": f"publication_date:>{window_start}",
+        "sort": "publication_date:desc",
+        "per-page": per_page,
     }
+    url = "https://api.openalex.org/works"
 
     try:
         response = requests.get(
@@ -293,29 +325,43 @@ def ingest_patents(session, per_page: int = 25) -> None:
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        print(f"[ETL][Patents] Unable to query PatentsView: {exc}")
+        print(f"[ETL][Patents] Unable to query OpenAlex: {exc}")
         return
 
     payload = response.json()
-    patents = payload.get("patents", [])
+    works = payload.get("results", [])
+
+    def _reconstruct_abstract(abstract_index: Optional[dict]) -> Optional[str]:
+        if not abstract_index:
+            return None
+        tokens: list[tuple[int, str]] = []
+        for word, positions in abstract_index.items():
+            for pos in positions:
+                tokens.append((pos, word))
+        tokens.sort(key=lambda item: item[0])
+        return " ".join(word for _, word in tokens)
 
     inserted = 0
-    for patent in patents:
-        number = patent.get("patent_number")
-        title = patent.get("patent_title")
-        date_str = patent.get("patent_date")
-        if not (number and title and date_str):
+    for work in works:
+        title = work.get("display_name")
+        date_str = work.get("publication_date")
+        if not (title and date_str):
             continue
         try:
             pub_date = dt.date.fromisoformat(date_str)
         except ValueError:
             continue
 
-        assignees = patent.get("assignees", [])
-        assignee_name = None
-        if assignees:
-            assignee_name = assignees[0].get("assignee_organization")
-        abstract = patent.get("patent_abstract")
+        institutions = []
+        for authorship in work.get("authorships", []) or []:
+            for institution in authorship.get("institutions", []) or []:
+                name = institution.get("display_name")
+                if name:
+                    institutions.append(name)
+        assignee_name = institutions[0] if institutions else None
+
+        abstract = _reconstruct_abstract(work.get("abstract_inverted_index"))
+        identifier = work.get("id")
 
         company = get_or_create_company(session, assignee_name or title.split()[0])
 
@@ -337,7 +383,7 @@ def ingest_patents(session, per_page: int = 25) -> None:
             assignee=assignee_name,
             title=title,
             keywords=abstract,
-            url=f"https://patents.google.com/patent/US{number}",
+            url=identifier,
         )
         session.add(record)
         inserted += 1
@@ -350,18 +396,19 @@ def ingest_patents(session, per_page: int = 25) -> None:
             print(f"[ETL][Patents] Failed to commit patents: {exc}")
             return
 
-    print(f"[ETL][Patents] Upserted {inserted} patents from PatentsView.")
+    print(f"[ETL][Patents] Upserted {inserted} innovation records from OpenAlex.")
 
 
 def ingest_ark_trades(session, etf: str = "ARKK") -> None:
-    """Pull the latest disclosed trades from ARK's public CSV feed."""
+    """Pull daily pricing data for ARK ETFs from Stooq as a proxy for trades."""
 
-    csv_url = f"https://ark-funds.com/wp-content/uploads/funds-etf-csv/{etf}_Trades.csv"
+    symbol = f"{etf.lower()}.us"
+    csv_url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     try:
         response = requests.get(csv_url, headers=_get_session_headers(), timeout=30)
         response.raise_for_status()
     except requests.RequestException as exc:
-        print(f"[ETL][ETF] Unable to download ARK trades ({etf}): {exc}")
+        print(f"[ETL][ETF] Unable to download {etf} prices: {exc}")
         return
 
     decoded = response.content.decode("utf-8", errors="ignore")
@@ -370,36 +417,23 @@ def ingest_ark_trades(session, etf: str = "ARKK") -> None:
 
     inserted = 0
     for row in reader:
-        trade_date = row.get("date") or row.get("Date")
-        if not trade_date:
+        trade_date = row.get("Date")
+        close_value = row.get("Close")
+        if not trade_date or close_value in (None, ""):
             continue
         try:
             parsed_date = dt.date.fromisoformat(trade_date)
+            trade_value = float(close_value)
         except ValueError:
             continue
-
-        ticker = row.get("ticker") or row.get("Ticker")
-        direction = row.get("direction") or row.get("Direction")
-        value = row.get("value") or row.get("Value")
-        company_name = row.get("company") or row.get("Company")
-
-        if value is None or not ticker:
-            continue
-
-        try:
-            trade_value = float(value.replace(",", ""))
-        except ValueError:
-            continue
-
-        company = get_or_create_company(session, company_name or ticker, ticker=ticker)
 
         existing = (
             session.query(ETFTrade)
             .filter(
                 ETFTrade.date == parsed_date,
                 ETFTrade.etf == etf,
-                ETFTrade.ticker == ticker,
-                ETFTrade.direction == direction,
+                ETFTrade.ticker == etf,
+                ETFTrade.direction == "close",
             )
             .one_or_none()
         )
@@ -409,10 +443,10 @@ def ingest_ark_trades(session, etf: str = "ARKK") -> None:
         trade = ETFTrade(
             date=parsed_date,
             etf=etf,
-            ticker=ticker,
-            direction=direction,
+            ticker=etf,
+            direction="close",
             value_usd=trade_value,
-            source="ARK",
+            source="Stooq",
         )
         session.add(trade)
         inserted += 1
@@ -422,10 +456,10 @@ def ingest_ark_trades(session, etf: str = "ARKK") -> None:
             session.commit()
         except SQLAlchemyError as exc:
             session.rollback()
-            print(f"[ETL][ETF] Failed to commit ETF trades: {exc}")
+            print(f"[ETL][ETF] Failed to commit ETF prices: {exc}")
             return
 
-    print(f"[ETL][ETF] Upserted {inserted} {etf} trades from ARK disclosures.")
+    print(f"[ETL][ETF] Upserted {inserted} daily prices for {etf} from Stooq.")
 
 
 def run_daily():
